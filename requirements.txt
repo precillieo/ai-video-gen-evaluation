@@ -1,0 +1,12 @@
+streamlit
+diffusers
+transformers
+opencv-python
+decord
+open_clip_torch
+torch
+Pillow
+moviepy
+huggingface_hub
+imageio
+imageio[ffmpeg]
