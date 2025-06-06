@@ -1,173 +1,40 @@
 import streamlit as st
-import torch
 import os
-import gc
-import numpy as np
 import tempfile
-import time
 from PIL import Image
-import matplotlib.pyplot as plt
-import io
-import clip
-from decord import VideoReader, cpu
-# import cv2
-from diffusers import StableDiffusionPipeline, FluxPipeline
-from transformers import BlipProcessor, BlipForConditionalGeneration
-import torch.nn.functional as F
+from model import ModelManager
+from evaluation import Evaluator
+from visualization import Visualizer
+from config import HF_TOKEN
 
-# Set page config
 st.set_page_config(page_title="AI Video/Image Gen Evaluation", layout="wide")
 
-# Initialize session state
-if 'device' not in st.session_state:
-    st.session_state.device = "cuda" if torch.cuda.is_available() else "cpu"
-    st.session_state.current_model = None
+# Sidebar: Metrics Documentation
+with st.sidebar.expander("📊 Metrics Guide", expanded=False):
+    st.markdown("""
+**CLIP Score**: Text-image similarity (higher is better, >25% good)
 
-# Cache CLIP and BLIP models (smaller models for evaluation)
-@st.cache_resource
-def load_clip_model():
-    device = st.session_state.device
-    model, preprocess = clip.load("ViT-B/32", device=device)
-    return model, preprocess
+**BLIP Caption**: AI-generated caption for qualitative check (should match prompt)
 
-@st.cache_resource
-def load_blip_model():
-    processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-    model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
-    model = model.to(st.session_state.device)
-    return model, processor
+**LPIPS Score**: Perceptual similarity (lower is better, <0.3 good)
 
-# Model loading functions WITHOUT caching (for generation models)
-def load_sd_1_5():
-    device = st.session_state.device
-    model_id = "runwayml/stable-diffusion-v1-5"
-    unload_models()  # Unload any previous model
-    pipe = StableDiffusionPipeline.from_pretrained(
-        model_id, 
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-        low_cpu_mem_usage=True
-    )
-    pipe = pipe.to(device)
-    st.session_state.current_model = "SD_1_5"
-    return pipe
+**SSIM**: Structural similarity (higher is better, >0.7 good)
 
-def load_sd_2_1():
-    device = st.session_state.device
-    model_id = "stabilityai/stable-diffusion-2-1"
-    unload_models()  # Unload any previous model
-    pipe = StableDiffusionPipeline.from_pretrained(
-        model_id, 
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-        low_cpu_mem_usage=True
-    )
-    pipe = pipe.to(device)
-    st.session_state.current_model = "SD_2_1"
-    return pipe
+**PSNR**: Signal-to-noise ratio (higher is better, >30 good)
 
-def load_flux():
-    device = st.session_state.device
-    unload_models()  # Unload any previous model
-    pipe = FluxPipeline.from_pretrained(
-        "black-forest-labs/FLUX.1-dev", 
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-        low_cpu_mem_usage=True
-    )
-    pipe = pipe.to(device)
-    st.session_state.current_model = "FLUX"
-    return pipe
+**Motion Magnitude**: Average movement (prompt-dependent)
 
-# Unload models and clear CUDA cache
-def unload_models():
-    # Clear CUDA cache
-    if st.session_state.device == "cuda":
-        torch.cuda.empty_cache()
-    # Force garbage collection
-    gc.collect()
-    st.session_state.current_model = None
+**Motion Smoothness**: Consistency of motion (lower is better, <2 good)
 
-# Utility functions
-def generate_blip_caption(image):
-    model, processor = load_blip_model()
-    inputs = processor(image, return_tensors="pt").to(st.session_state.device)
-    with torch.no_grad():
-        out = model.generate(**inputs, max_length=30)
-    caption = processor.decode(out[0], skip_special_tokens=True)
-    return caption
+**Temporal Consistency**: Motion correlation (higher is better, >0.5 good)
 
-def extract_frames(video_path, num_frames=8):
-    vr = VideoReader(video_path, ctx=cpu(0))
-    total_frames = len(vr)
-    interval = max(total_frames // num_frames, 1)
-    frame_indices = [i * interval for i in range(min(num_frames, total_frames))]
-    frames = vr.get_batch(frame_indices).asnumpy()
-    images = [Image.fromarray(frame) for frame in frames]
-    return images
+**Blur Score**: Image sharpness (higher is better, >30 good)
+    """)
 
-def compute_clip_score(prompt_text, images):
-    model_clip, preprocess_clip = load_clip_model()
-    
-    with torch.no_grad():
-        text_tokens = clip.tokenize([prompt_text]).to(st.session_state.device)
-        text_emb = model_clip.encode_text(text_tokens)
-
-        # Process images
-        if isinstance(images, list):
-            # For video frames
-            frame_embs = []
-            for frame in images:
-                processed = preprocess_clip(frame).unsqueeze(0).to(st.session_state.device)
-                frame_embs.append(model_clip.encode_image(processed))
-            image_emb = torch.cat(frame_embs, dim=0).mean(dim=0, keepdim=True)
-        else:
-            # For single image
-            processed = preprocess_clip(images).unsqueeze(0).to(st.session_state.device)
-            image_emb = model_clip.encode_image(processed)
-
-        # Normalize embeddings
-        text_emb = text_emb / text_emb.norm(dim=-1, keepdim=True)
-        image_emb = image_emb / image_emb.norm(dim=-1, keepdim=True)
-
-        # Calculate similarity
-        similarity = (image_emb @ text_emb.T).item() * 100  # Convert to percentage
-    
-    return similarity
-
-def text_to_image(model_name, prompt, guidance=7.5, steps=30):
-    with st.spinner(f"Loading {model_name} model..."):
-        if model_name == "Stable Diffusion 1.5":
-            pipe = load_sd_1_5()
-        elif model_name == "Stable Diffusion 2.1":
-            pipe = load_sd_2_1()
-        elif model_name == "FLUX AI":
-            pipe = load_flux()
-    
-    with st.spinner(f"Generating image with {model_name}..."):
-        # Set seed for reproducibility
-        generator = torch.Generator(device=st.session_state.device).manual_seed(42)
-        
-        if model_name == "FLUX AI":
-            image = pipe(
-                prompt,
-                height=512,
-                width=512,
-                guidance_scale=guidance,
-                num_inference_steps=steps,
-                generator=generator
-            ).images[0]
-        else:
-            image = pipe(
-                prompt, 
-                guidance_scale=guidance, 
-                num_inference_steps=steps,
-                generator=generator
-            ).images[0]
-        
-        # Move model to CPU and clear GPU memory after generation
-        if st.session_state.device == "cuda":
-            pipe.to("cpu")
-            torch.cuda.empty_cache()
-    
-    return image
+# Initialize managers
+model_manager = ModelManager()
+evaluator = Evaluator(model_manager)
+visualizer = Visualizer()
 
 # Main app layout
 st.title("AI Video/Image Gen Evaluation")
@@ -179,40 +46,28 @@ evaluation_type = st.sidebar.selectbox(
     ["Text to Image", "Text to Video", "Image to Video"]
 )
 
-# Memory management info
-memory_info = ""
-if st.session_state.device == "cuda":
-    allocated = torch.cuda.memory_allocated() / (1024 ** 3)
-    reserved = torch.cuda.memory_reserved() / (1024 ** 3)
-    memory_info = f"GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+# Memory management
+st.sidebar.info(model_manager.get_memory_info())
 
-st.sidebar.info(memory_info if memory_info else "Running on CPU")
-
-# Add a button to manually clear memory
 if st.sidebar.button("Clear Memory"):
-    unload_models()
+    model_manager.unload_models()
     st.sidebar.success("Memory cleared!")
 
 # Main content area
+st.header(f"{evaluation_type} Generation")
+
 if evaluation_type == "Text to Image":
-    st.header("Text to Image Generation")
-    
-    # Input prompt
     prompt = st.text_area("Enter your prompt:", "A photo of a cute cat sitting on a wooden chair")
     
-    # Model parameters
     col1, col2 = st.columns(2)
     with col1:
         guidance_scale = st.slider("Guidance Scale", 1.0, 20.0, 7.5, 0.5)
     with col2:
         steps = st.slider("Inference Steps", 10, 100, 30, 5)
     
-    # Models to evaluate
-    t2i_models = ["Stable Diffusion 1.5", "Stable Diffusion 2.1", "FLUX AI"]
-    
-    # Option to select specific models
+    t2i_models = ["Stable Diffusion 1.5", "Stable Diffusion 2.1"]
     selected_models = st.multiselect(
-        "Select models to evaluate (default: all)",
+        "Select models to evaluate",
         t2i_models,
         default=t2i_models
     )
@@ -220,68 +75,77 @@ if evaluation_type == "Text to Image":
     if not selected_models:
         st.warning("Please select at least one model to evaluate")
     elif st.button("Generate and Evaluate"):
-        # Set up the display area
         results_cols = st.columns(len(selected_models))
         metrics_cols = st.columns(len(selected_models))
         
         results = {}
+        successful_models = []
         
-        # Generate images sequentially for each model and calculate metrics
         for i, model_name in enumerate(selected_models):
             with results_cols[i]:
-                st.subheader(model_name)
-                image = text_to_image(model_name, prompt, guidance_scale, steps)
-                st.image(image, use_container_width=True)
-                results[model_name] = {"image": image}
-                
-                # Calculate CLIP Score
-                clip_score = compute_clip_score(prompt, image)
-                st.metric("CLIP Score", f"{clip_score:.2f}%")
-                
-                # BLIP Caption
-                blip_caption = generate_blip_caption(image)
-                st.text_area("BLIP Caption", blip_caption, height=100)
-                
-                results[model_name]["clip_score"] = clip_score
-                results[model_name]["blip_caption"] = blip_caption
+                try:
+                    image = evaluator.text_to_image(model_name, prompt, guidance_scale, steps)
+                    if image is not None:
+                        # Get comprehensive evaluation metrics
+                        prompt_alignment = evaluator.evaluate_prompt_alignment(prompt, image)
+                        visual_quality = evaluator.compute_visual_quality(image)
+                        
+                        results[model_name] = {
+                            "image": image,
+                            "clip_score": prompt_alignment["clip_score"],
+                            "blip_caption": prompt_alignment["blip_caption"],
+                            "blur_score": visual_quality["blur_score"],
+                            "color_consistency": visual_quality["color_consistency"]
+                        }
+                        successful_models.append(model_name)
+                        
+                        # Display results
+                        st.image(image, caption=f"Generated by {model_name}")
+                        
+                        # Display metrics
+                        with metrics_cols[i]:
+                            st.metric("CLIP Score", f"{results[model_name]['clip_score']:.2f}%")
+                            st.metric("Blur Score", f"{results[model_name]['blur_score']:.2f}")
+                            st.metric("Color Consistency", f"{results[model_name]['color_consistency']:.2f}")
+                            st.text_area("BLIP Caption", results[model_name]["blip_caption"], height=100)
+                except Exception as e:
+                    st.error(f"Error with {model_name}: {str(e)}")
+        
+        if successful_models:
+            # Display comparison charts
+            col1, col2 = st.columns(2)
+            with col1:
+                st.subheader("Model Comparison - CLIP Score")
+                chart_data = {model: results[model]["clip_score"] for model in successful_models}
+                fig = visualizer.plot_comparison_chart(
+                    chart_data,
+                    "Text-to-Image Model Comparison",
+                    "CLIP Score (%)"
+                )
+                st.pyplot(fig)
             
-            # Explicitly unload the model after each use
-            unload_models()
+            with col2:
+                st.subheader("Model Comparison - Visual Quality")
+                chart_data = {
+                    model: {
+                        "Blur Score": results[model]["blur_score"],
+                        "Color Consistency": results[model]["color_consistency"]
+                    }
+                    for model in successful_models
+                }
+                fig = visualizer.plot_comparison_chart(
+                    chart_data,
+                    "Visual Quality Metrics",
+                    "Score"
+                )
+                st.pyplot(fig)
         
-        # Display comparison chart
-        st.subheader("Model Comparison - CLIP Score")
-        chart_data = {model: results[model]["clip_score"] for model in selected_models}
-        
-        fig, ax = plt.subplots(figsize=(10, 5))
-        colors = ['#FF9999', '#66B2FF', '#99FF99']
-        bars = ax.bar(chart_data.keys(), chart_data.values(), color=colors[:len(chart_data)])
-        ax.set_ylim(0, 100)
-        ax.set_ylabel('CLIP Score (%)')
-        ax.set_title('Text-to-Image Model Comparison')
-        
-        # Add value labels on top of each bar
-        for bar in bars:
-            height = bar.get_height()
-            ax.annotate(f'{height:.1f}',
-                        xy=(bar.get_x() + bar.get_width() / 2, height),
-                        xytext=(0, 3),  # 3 points vertical offset
-                        textcoords="offset points",
-                        ha='center', va='bottom')
-        
-        # Display the chart
-        st.pyplot(fig)
-        
-        # Final memory cleanup
-        unload_models()
+        model_manager.unload_models()
 
 elif evaluation_type == "Text to Video":
-    st.header("Text to Video Generation")
     st.warning("This feature is under development. For now, you can upload videos and evaluate them.")
     
-    # Input prompt
     prompt = st.text_area("Enter your prompt:", "A cat walking in a garden")
-    
-    # Video upload
     uploaded_videos = st.file_uploader("Upload videos to evaluate", type=["mp4", "avi", "mov"], accept_multiple_files=True)
     
     if uploaded_videos and st.button("Evaluate Videos"):
@@ -289,91 +153,98 @@ elif evaluation_type == "Text to Video":
             st.warning("Please upload a maximum of 3 videos for comparison")
             uploaded_videos = uploaded_videos[:3]
         
-        # Set up columns for each video
-        video_cols = st.columns(len(uploaded_videos))
-        metrics_cols = st.columns(len(uploaded_videos))
-        
         results = {}
-        
-        # Process each uploaded video
+        video_cols = st.columns(len(uploaded_videos))
+        temp_files = []
         for i, video_file in enumerate(uploaded_videos):
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+            temp_file.write(video_file.read())
+            temp_file.close()
+            temp_files.append(temp_file.name)
             with video_cols[i]:
-                # Save the uploaded video to a temporary file
-                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
-                temp_file.write(video_file.read())
-                temp_file.close()
-                
-                st.subheader(f"Video {i+1}: {video_file.name}")
                 st.video(temp_file.name)
-                
-                # Extract frames
-                frames = extract_frames(temp_file.name)
-                results[video_file.name] = {"frames": frames, "path": temp_file.name}
+                try:
+                    frames = evaluator.extract_frames(temp_file.name)
+                    prompt_alignment = evaluator.evaluate_prompt_alignment(prompt, frames[0])
+                    motion_metrics = evaluator.compute_motion_metrics(frames)
+                    visual_quality = evaluator.compute_visual_quality(frames[0])
+                    results[video_file.name] = {
+                        "frames": frames,
+                        "clip_score": prompt_alignment["clip_score"],
+                        "blip_caption": prompt_alignment["blip_caption"],
+                        "motion_magnitude": motion_metrics["motion_magnitude"],
+                        "motion_smoothness": motion_metrics["motion_smoothness"],
+                        "temporal_consistency": motion_metrics["temporal_consistency"],
+                        "blur_score": visual_quality["blur_score"],
+                        "path": temp_file.name
+                    }
+
+                    st.metric("CLIP Score", f"{results[video_file.name]['clip_score']:.2f}%")
+                    st.text_area("BLIP Score", results[video_file.name]["blip_caption"], height=70)
+
+                    st.metric("Motion Magnitude.", f"{results[video_file.name]['motion_magnitude']:.2f}")
+                    st.metric("Motion Smoothness", f"{results[video_file.name]['motion_smoothness']:.2f}")
+                    st.metric("Temporal Consistency.", f"{results[video_file.name]['temporal_consistency']:.2f}")
+
+                    st.metric("Blur Score", f"{results[video_file.name]['blur_score']:.2f}")
+                except Exception as e:
+                    st.error(f"Error processing video {video_file.name}: {str(e)}")
         
-        # Calculate and display metrics
-        for i, video_name in enumerate(results.keys()):
-            with metrics_cols[i]:
-                frames = results[video_name]["frames"]
-                
-                # Display first frame
-                st.image(frames[0], caption="First frame", use_container_width=True)
-                
-                # CLIP Score
-                clip_score = compute_clip_score(prompt, frames)
-                st.metric("CLIP Score", f"{clip_score:.2f}%")
-                
-                # BLIP Caption for first frame
-                blip_caption = generate_blip_caption(frames[0])
-                st.text_area("BLIP Caption (first frame)", blip_caption, height=100)
-                
-                results[video_name]["clip_score"] = clip_score
-                results[video_name]["blip_caption"] = blip_caption
-                
-                # Clear GPU memory after processing each video
-                if st.session_state.device == "cuda":
-                    torch.cuda.empty_cache()
-        
-        # Display comparison chart
-        st.subheader("Video Comparison - CLIP Score")
-        chart_data = {name: results[name]["clip_score"] for name in results.keys()}
-        
-        fig, ax = plt.subplots(figsize=(10, 5))
-        bars = ax.bar(chart_data.keys(), chart_data.values(), color=['#FF9999', '#66B2FF', '#99FF99'][:len(chart_data)])
-        ax.set_ylim(0, 100)
-        ax.set_ylabel('CLIP Score (%)')
-        ax.set_title('Text-to-Video Evaluation')
-        
-        # Add value labels on top of each bar
-        for bar in bars:
-            height = bar.get_height()
-            ax.annotate(f'{height:.1f}',
-                        xy=(bar.get_x() + bar.get_width() / 2, height),
-                        xytext=(0, 3),  # 3 points vertical offset
-                        textcoords="offset points",
-                        ha='center', va='bottom')
-        
-        # Clean up temp files
-        for video_name in results:
-            os.unlink(results[video_name]["path"])
-            
-        # Display the chart
-        st.pyplot(fig)
-        
-        # Final memory cleanup
-        unload_models()
+        if results:
+            st.markdown("---")
+            st.markdown("## Video Comparison Visualizations")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.subheader("Video Comparison - CLIP Score")
+                chart_data = {name: results[name]["clip_score"] for name in results.keys()}
+                fig = visualizer.plot_comparison_chart(
+                    chart_data,
+                    "Text-to-Video Evaluation",
+                    "CLIP Score (%)"
+                )
+                st.pyplot(fig)
+            with col2:
+                st.subheader("Video Comparison - Motion Quality")
+                chart_data = {
+                    name: {
+                        "Motion Magnitude": results[name]["motion_magnitude"],
+                        "Motion Smoothness": results[name]["motion_smoothness"],
+                        "Temporal Consistency": results[name]["temporal_consistency"]
+                    }
+                    for name in results.keys()
+                }
+                fig = visualizer.plot_comparison_chart(
+                    chart_data,
+                    "Motion Quality Metrics",
+                    "Score"
+                )
+                st.pyplot(fig)
+            st.subheader("Video Comparison - Visual Quality")
+            chart_data = {
+                name: {
+                    "Blur Score": results[name]["blur_score"]
+                }
+                for name in results.keys()
+            }
+            fig = visualizer.plot_comparison_chart(
+                chart_data,
+                "Visual Quality Metrics",
+                "Score"
+            )
+            st.pyplot(fig)
+        # Cleanup
+        for temp_path in temp_files:
+            os.unlink(temp_path)
+        model_manager.unload_models()
 
 elif evaluation_type == "Image to Video":
-    st.header("Image to Video Generation")
     st.warning("This feature is under development. For now, you can upload a reference image and evaluate videos against it.")
     
-    # Image upload
     reference_image = st.file_uploader("Upload reference image", type=["jpg", "jpeg", "png"])
-    
-    # Video upload
     uploaded_videos = st.file_uploader("Upload videos to evaluate", type=["mp4", "avi", "mov"], accept_multiple_files=True)
     
     if reference_image and uploaded_videos and st.button("Evaluate Videos"):
-        # Display reference image
+        # Load and display reference image
         ref_img = Image.open(reference_image)
         st.image(ref_img, caption="Reference Image", width=300)
         
@@ -381,16 +252,11 @@ elif evaluation_type == "Image to Video":
             st.warning("Please upload a maximum of 3 videos for comparison")
             uploaded_videos = uploaded_videos[:3]
         
-        # Set up columns for each video
         video_cols = st.columns(len(uploaded_videos))
-        metrics_cols = st.columns(len(uploaded_videos))
-        
         results = {}
         
-        # Process each uploaded video
         for i, video_file in enumerate(uploaded_videos):
             with video_cols[i]:
-                # Save the uploaded video to a temporary file
                 temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
                 temp_file.write(video_file.read())
                 temp_file.close()
@@ -398,77 +264,77 @@ elif evaluation_type == "Image to Video":
                 st.subheader(f"Video {i+1}: {video_file.name}")
                 st.video(temp_file.name)
                 
-                # Extract frames
-                frames = extract_frames(temp_file.name)
-                results[video_file.name] = {"frames": frames, "path": temp_file.name}
-        
-        # Calculate and display metrics
-        for i, video_name in enumerate(results.keys()):
-            with metrics_cols[i]:
-                frames = results[video_name]["frames"]
-                
-                # Display first frame
-                st.image(frames[0], caption="First frame", use_container_width=True)
-                
-                # Calculate similarity using CLIP
-                model_clip, preprocess_clip = load_clip_model()
-                
-                with torch.no_grad():
-                    # Process reference image
-                    ref_processed = preprocess_clip(ref_img).unsqueeze(0).to(st.session_state.device)
-                    ref_emb = model_clip.encode_image(ref_processed)
+                try:
+                    frames = evaluator.extract_frames(temp_file.name)
                     
-                    # Process video frames
-                    frame_embs = []
-                    for frame in frames:
-                        processed = preprocess_clip(frame).unsqueeze(0).to(st.session_state.device)
-                        frame_embs.append(model_clip.encode_image(processed))
+                    # Get comprehensive evaluation metrics
+                    similarity = evaluator.compute_clip_score(ref_img, frames)
+                    motion_metrics = evaluator.compute_motion_metrics(frames)
+                    visual_quality = evaluator.compute_visual_quality(frames[0], ref_img)
                     
-                    frame_emb = torch.cat(frame_embs, dim=0).mean(dim=0, keepdim=True)
+                    results[video_file.name] = {
+                        "frames": frames,
+                        "clip_score": similarity,
+                        "motion_magnitude": motion_metrics["motion_magnitude"],
+                        "motion_smoothness": motion_metrics["motion_smoothness"],
+                        "temporal_consistency": motion_metrics["temporal_consistency"],
+                        "lpips_score": visual_quality["lpips_score"],
+                        "ssim": visual_quality["ssim"],
+                        "psnr": visual_quality["psnr"],
+                        "path": temp_file.name
+                    }
                     
-                    # Normalize embeddings
-                    ref_emb = ref_emb / ref_emb.norm(dim=-1, keepdim=True)
-                    frame_emb = frame_emb / frame_emb.norm(dim=-1, keepdim=True)
-                    
-                    # Calculate similarity
-                    similarity = (frame_emb @ ref_emb.T).item() * 100  # Convert to percentage
-                
-                st.metric("Image-Video Similarity", f"{similarity:.2f}%")
-                results[video_name]["similarity"] = similarity
-                
-                # Clear GPU memory after each video
-                if st.session_state.device == "cuda":
-                    torch.cuda.empty_cache()
+                    # Display metrics
+                    st.metric("Image-Video Similarity", f"{results[video_file.name]['clip_score']:.2f}%")
+                    st.metric("LPIPS Score", f"{results[video_file.name]['lpips_score']:.2f}")
+                    st.metric("SSIM", f"{results[video_file.name]['ssim']:.2f}")
+                    st.metric("PSNR", f"{results[video_file.name]['psnr']:.2f}")
+                    st.metric("Motion Magnitude", f"{results[video_file.name]['motion_magnitude']:.2f}")
+                except Exception as e:
+                    st.error(f"Error processing video {video_file.name}: {str(e)}")
         
-        # Display comparison chart
-        st.subheader("Video Comparison - Image Similarity")
-        chart_data = {name: results[name]["similarity"] for name in results.keys()}
+        if results:
+            # Display comparison charts
+            col1, col2 = st.columns(2)
+            with col1:
+                st.subheader("Video Comparison - Image Similarity")
+                chart_data = {
+                    name: {
+                        "CLIP Score": results[name]["clip_score"],
+                        "LPIPS Score": results[name]["lpips_score"],
+                        "SSIM": results[name]["ssim"],
+                        "PSNR": results[name]["psnr"]
+                    }
+                    for name in results.keys()
+                }
+                fig = visualizer.plot_comparison_chart(
+                    chart_data,
+                    "Image-Video Similarity Metrics",
+                    "Score"
+                )
+                st.pyplot(fig)
+            
+            with col2:
+                st.subheader("Video Comparison - Motion Quality")
+                chart_data = {
+                    name: {
+                        "Motion Magnitude": results[name]["motion_magnitude"],
+                        "Motion Smoothness": results[name]["motion_smoothness"],
+                        "Temporal Consistency": results[name]["temporal_consistency"]
+                    }
+                    for name in results.keys()
+                }
+                fig = visualizer.plot_comparison_chart(
+                    chart_data,
+                    "Motion Quality Metrics",
+                    "Score"
+                )
+                st.pyplot(fig)
         
-        fig, ax = plt.subplots(figsize=(10, 5))
-        bars = ax.bar(chart_data.keys(), chart_data.values(), color=['#FF9999', '#66B2FF', '#99FF99'][:len(chart_data)])
-        ax.set_ylim(0, 100)
-        ax.set_ylabel('Similarity Score (%)')
-        ax.set_title('Image-to-Video Evaluation')
-        
-        # Add value labels on top of each bar
-        for bar in bars:
-            height = bar.get_height()
-            ax.annotate(f'{height:.1f}',
-                        xy=(bar.get_x() + bar.get_width() / 2, height),
-                        xytext=(0, 3),  # 3 points vertical offset
-                        textcoords="offset points",
-                        ha='center', va='bottom')
-        
-        # Clean up temp files
+        # Cleanup
         for video_name in results:
             os.unlink(results[video_name]["path"])
-            
-        # Display the chart
-        st.pyplot(fig)
-        
-        # Final memory cleanup
-        unload_models()
+        model_manager.unload_models()
 
-# Add footer
 st.markdown("---")
 st.markdown("AI Video/Image Gen Evaluation | Created with Streamlit")

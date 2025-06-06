@@ -2,11 +2,16 @@ streamlit
 diffusers
 transformers
 opencv-python
-decord
+# decord
 open_clip_torch
 torch
+torchvision
 Pillow
 moviepy
 huggingface_hub
 imageio
 imageio[ffmpeg]
+python-dotenv
+lpips
+scikit-image
+numpy
